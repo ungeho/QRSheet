@@ -125,3 +125,94 @@ def test_layout_settings_restore_and_reset(tmp_path):
     assert restored.editor.toPlainText() == "入力を保持"
     assert "プレビューを更新" in restored.preview_note.text()
     restored.close()
+
+
+def wait_for_preview(app, window):
+    deadline = time.monotonic() + 10
+    while (window.preview_timer.isActive() or window.worker is not None or window.preview_pending) and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert window.worker is None
+    assert not window.preview_pending
+    assert not window.preview_timer.isActive()
+
+
+def test_auto_preview_debounce_and_latest_settings(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    manager = SettingsManager(QSettings(str(tmp_path / "auto.ini"), QSettings.Format.IniFormat))
+    manager.set_output_directory(tmp_path / "saved")
+    window = MainWindow(manager)
+    starts = []
+    original = PdfWorker.start
+    def record(worker):
+        starts.append((worker.texts, worker.settings))
+        original(worker)
+    monkeypatch.setattr(PdfWorker, "start", record)
+    window.editor.setPlainText("初めの入力")
+    window.title.setText("更新タイトル")
+    window.layout_controls["horizontal_align"].setCurrentIndex(2)
+    window.layout_controls["horizontal_gap_mm"].setValue(0)
+    assert not starts
+    wait_for_preview(app, window)
+    assert len(starts) == 1
+    assert starts[0][1].horizontal_align == "right"
+    assert starts[0][1].horizontal_gap_mm == 0
+    assert "更新タイトル" in window.document.getAllText(0).text()
+    assert not (tmp_path / "saved").exists()
+    window.editor.setPlainText("古い入力")
+    window.start_generation(True)
+    window.editor.setPlainText("最新の入力")
+    window.orientation.setCurrentIndex(1)
+    # Fire while busy: the queued update must survive until the worker finishes.
+    window.preview_timer.stop()
+    window.update_preview_automatically()
+    assert window.preview_pending
+    wait_for_preview(app, window)
+    assert len(starts) == 3
+    assert "最新の入力" in window.document.getAllText(0).text()
+    assert "古い入力" not in window.document.getAllText(0).text()
+    size = window.document.pagePointSize(0)
+    assert size.width() > size.height()
+    window.close()
+
+
+def test_auto_preview_clear_errors_and_recovery(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(SettingsManager(QSettings(str(tmp_path / "errors.ini"), QSettings.Format.IniFormat)))
+    def unexpected(*args):
+        raise AssertionError("Automatic preview must not open a modal dialog")
+    monkeypatch.setattr(QMessageBox, "warning", unexpected)
+    monkeypatch.setattr(QMessageBox, "information", unexpected)
+    window.editor.setPlainText("入力")
+    window.columns.setCurrentIndex(4)
+    window.qr_size.setValue(60)
+    wait_for_preview(app, window)
+    assert "プレビューを更新できません" in window.preview_note.text()
+    window.qr_size.setValue(35)
+    wait_for_preview(app, window)
+    assert window.document.pageCount() == 1
+    window.start_generation(True)
+    window.editor.clear()
+    wait_for_preview(app, window)
+    assert window.document.pageCount() == 0
+    assert not window.preview_pending
+    window.editor.setPlainText("終了前の入力")
+    assert window.preview_timer.isActive()
+    window.close()
+    assert not window.preview_timer.isActive()
+
+
+def test_auto_preview_after_save(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    manager = SettingsManager(QSettings(str(tmp_path / "save-auto.ini"), QSettings.Format.IniFormat))
+    manager.set_output_directory(tmp_path / "saved")
+    window = MainWindow(manager)
+    window.editor.setPlainText("保存内容")
+    window.start_generation()
+    window.editor.setPlainText("プレビュー用の変更")
+    wait_for_preview(app, window)
+    assert "保存内容" in PdfReader(window.last_pdf).pages[0].extract_text()
+    assert "プレビュー用の変更" in window.document.getAllText(0).text().replace("\r", "").replace("\n", "")
+    assert len(list((tmp_path / "saved").glob("*.pdf"))) == 1
+    window.close()

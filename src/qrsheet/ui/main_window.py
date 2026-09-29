@@ -3,7 +3,7 @@ from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from PySide6.QtCore import QThread, Signal, QUrl, QBuffer, QIODevice
+from PySide6.QtCore import QThread, Signal, QUrl, QBuffer, QIODevice, QTimer
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -71,6 +71,12 @@ class MainWindow(QMainWindow):
         self.manager = manager or SettingsManager()
         self.worker = None
         self.last_pdf = None
+        self.preview_revision = 0
+        self.preview_pending = False
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(500)
+        self.preview_timer.timeout.connect(self.update_preview_automatically)
         self.preview_directory = TemporaryDirectory(prefix="QRSheet-preview-")
         self.setWindowTitle("QRSheet")
         self.resize(1160, 800)
@@ -178,7 +184,7 @@ class MainWindow(QMainWindow):
         preview_panel = QWidget()
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.addWidget(QLabel("PDFプレビュー"))
-        self.preview_note = QLabel("「プレビューを更新」で、現在の入力・設定を確認できます。")
+        self.preview_note = QLabel("入力や設定を変更すると、プレビューが自動更新されます。")
         self.preview_note.setWordWrap(True)
         preview_layout.addWidget(self.preview_note)
         self.document = QPdfDocument(self)
@@ -263,7 +269,20 @@ class MainWindow(QMainWindow):
         self.mark_stale()
 
     def mark_stale(self, *_):
-        self.preview_note.setText("現在の入力・設定を反映するには「プレビューを更新」を押してください。")
+        self.preview_revision += 1
+        self.preview_timer.stop()
+        self.preview_pending = bool(parse_lines(self.editor.toPlainText()))
+        if not self.preview_pending:
+            self.document.close()
+            self.preview_buffer.close()
+            self.preview_note.setText("文字列を入力すると、プレビューが自動更新されます。")
+            return
+        self.preview_note.setText("プレビューを更新待ちです…")
+        self.preview_timer.start()
+
+    def update_preview_automatically(self):
+        if self.preview_pending and self.worker is None:
+            self.start_generation(preview_only=True, auto_preview=True)
 
     def refresh_output_directory(self):
         self.output_path.setText(str(self.manager.output_directory()))
@@ -301,34 +320,46 @@ class MainWindow(QMainWindow):
             logger.warning("Text import failed", exc_info=True)
             QMessageBox.warning(self, "読み込みエラー", str(exc) if isinstance(exc, UserError) else "ファイルを読み込めません。アクセス権を確認してください。")
 
-    def start_generation(self, preview_only=False, save_as=False):
+    def start_generation(self, preview_only=False, save_as=False, auto_preview=False):
         if self.worker is not None:
             return
         texts = parse_lines(self.editor.toPlainText())
         if not texts:
-            QMessageBox.information(self, "入力を確認", "1件以上の文字列を入力してください。")
+            if not auto_preview:
+                QMessageBox.information(self, "入力を確認", "1件以上の文字列を入力してください。")
             return
+        revision = self.preview_revision
+        if preview_only:
+            self.preview_timer.stop()
+            self.preview_pending = False
         settings = self.current_settings()
         try:
             settings.validate()
         except UserError as exc:
-            QMessageBox.warning(self, "設定を確認", str(exc))
+            if auto_preview:
+                self.preview_note.setText(f"プレビューを更新できません: {exc}")
+            else:
+                QMessageBox.warning(self, "設定を確認", str(exc))
             return
         if preview_only:
-            self.document.close()
-            self.preview_buffer.close()
             path = str(Path(self.preview_directory.name) / "preview.pdf")
         elif save_as:
+            self.preview_timer.stop()
             proposed = self.manager.output_directory() / f"QRSheet_{date.today().isoformat()}.pdf"
             path, _ = QFileDialog.getSaveFileName(self, "PDFを保存", str(proposed), "PDF (*.pdf)")
             if not path:
+                if self.preview_pending:
+                    self.preview_timer.start()
                 return
             if not path.lower().endswith(".pdf"):
                 path += ".pdf"
                 if Path(path).exists() and QMessageBox.question(self, "上書き確認", "同名のPDFがあります。上書きしますか？") != QMessageBox.StandardButton.Yes:
+                    if self.preview_pending:
+                        self.preview_timer.start()
                     return
         else:
             path = self.manager.output_directory() / f"QRSheet_{date.today().isoformat()}.pdf"
+        self.preview_timer.stop()
         self.manager.save(settings)
         self.generate_button.setEnabled(False)
         self.preview_button.setEnabled(False)
@@ -342,13 +373,17 @@ class MainWindow(QMainWindow):
         self.status.setText("PDFを生成しています…")
         self.worker = PdfWorker(texts, path, settings, self, automatic=not preview_only and not save_as)
         self.worker.progress.connect(lambda done, total: self.progress.setValue(done))
-        self.worker.succeeded.connect(lambda saved, pages: self.generation_done(saved, pages, preview_only))
-        self.worker.failed.connect(self.generation_failed)
+        self.worker.succeeded.connect(lambda saved, pages: self.generation_done(saved, pages, preview_only, revision))
+        self.worker.failed.connect(lambda message: self.generation_failed(message, auto_preview, revision))
         self.worker.finished.connect(self.worker_finished)
         self.worker.start()
 
-    def generation_done(self, path, pages, preview_only):
+    def generation_done(self, path, pages, preview_only, revision=None):
         if preview_only:
+            if revision is not None and revision != self.preview_revision:
+                return
+            self.document.close()
+            self.preview_buffer.close()
             self.preview_buffer.setData(Path(path).read_bytes())
             self.preview_buffer.open(QIODevice.OpenModeFlag.ReadOnly)
             self.document.load(self.preview_buffer)
@@ -360,7 +395,12 @@ class MainWindow(QMainWindow):
             self.open_folder.setEnabled(True)
             self.status.setText(f"PDFを生成しました · {pages}ページ · {path}")
 
-    def generation_failed(self, message):
+    def generation_failed(self, message, auto_preview=False, revision=None):
+        if auto_preview:
+            if revision == self.preview_revision:
+                self.preview_note.setText(f"プレビューを更新できません: {message}")
+                self.status.setText("入力・設定を変更すると、再び自動更新します。")
+            return
         self.status.setText("生成できませんでした。入力・設定を確認してください。")
         QMessageBox.warning(self, "PDF生成エラー", message)
 
@@ -374,6 +414,8 @@ class MainWindow(QMainWindow):
         self.reset_folder.setEnabled(True)
         self.reset_pdf_settings_button.setEnabled(True)
         self.progress.hide()
+        if self.preview_pending and not self.preview_timer.isActive():
+            self.preview_timer.start()
 
     def open_path(self, path):
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
@@ -390,5 +432,7 @@ class MainWindow(QMainWindow):
             logger.warning("Invalid settings were not saved on close")
         self.document.close()
         self.preview_buffer.close()
+        self.preview_timer.stop()
+        self.preview_pending = False
         self.preview_directory.cleanup()
         event.accept()
