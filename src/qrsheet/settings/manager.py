@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from qrsheet.qr.generator import UserError
 
 
@@ -25,6 +26,23 @@ class SettingsManager:
     def __init__(self, store=None):
         from PySide6.QtCore import QSettings
         self.store = store if store is not None else QSettings("QRSheet", "QRSheet")
+
+    @staticmethod
+    def default_output_directory():
+        from PySide6.QtCore import QStandardPaths
+        documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        return Path(documents or (Path.home() / "Documents")) / "QRSheet"
+
+    def output_directory(self):
+        value = self.store.value("output_directory", "", type=str)
+        return Path(value) if value and Path(value).is_absolute() else self.default_output_directory()
+
+    def set_output_directory(self, path=None):
+        if path is None:
+            self.store.remove("output_directory")
+        else:
+            self.store.setValue("output_directory", str(Path(path).resolve()))
+        self.store.sync()
 
     def load(self):
         defaults = PdfSettings()

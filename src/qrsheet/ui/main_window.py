@@ -24,13 +24,30 @@ class PdfWorker(QThread):
     succeeded = Signal(str, int)
     failed = Signal(str)
 
-    def __init__(self, texts, path, settings, parent=None):
+    def __init__(self, texts, path, settings, parent=None, automatic=False):
         super().__init__(parent)
         self.texts, self.path, self.settings = texts, path, settings
+        self.automatic = automatic
 
     def run(self):
+        reserved = None
         try:
+            if self.automatic:
+                base = Path(self.path)
+                base.parent.mkdir(parents=True, exist_ok=True)
+                number = 0
+                while True:
+                    candidate = base if number == 0 else base.with_stem(f"{base.stem}_{number:03d}")
+                    try:
+                        with candidate.open("xb"):
+                            pass
+                        reserved = candidate
+                        self.path = candidate
+                        break
+                    except FileExistsError:
+                        number += 1
             pages = generate_pdf(self.texts, self.path, self.settings, self.progress.emit)
+            reserved = None
             self.succeeded.emit(str(self.path), pages)
         except UserError as exc:
             self.failed.emit(str(exc))
@@ -40,6 +57,12 @@ class PdfWorker(QThread):
         except Exception:
             logger.exception("PDF generation failed")
             self.failed.emit("PDFを生成できませんでした。設定と入力を確認して、もう一度お試しください。")
+        finally:
+            if reserved is not None:
+                try:
+                    reserved.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove reserved output file", exc_info=True)
 
 
 class MainWindow(QMainWindow):
@@ -127,6 +150,19 @@ class MainWindow(QMainWindow):
         self.status = QLabel("文字列を入力して、PDFを生成してください。")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        destination = QHBoxLayout()
+        destination.addWidget(QLabel("PDF保存先"))
+        self.output_path = QLineEdit(str(self.manager.output_directory()))
+        self.output_path.setReadOnly(True)
+        self.output_path.setToolTip(self.output_path.text())
+        destination.addWidget(self.output_path, 1)
+        self.change_folder = QPushButton("変更…")
+        self.change_folder.clicked.connect(self.choose_output_directory)
+        destination.addWidget(self.change_folder)
+        self.reset_folder = QPushButton("既定に戻す")
+        self.reset_folder.clicked.connect(self.reset_output_directory)
+        destination.addWidget(self.reset_folder)
+        layout.addLayout(destination)
         actions = QHBoxLayout()
         self.open_pdf = QPushButton("PDFを開く")
         self.open_folder = QPushButton("保存先フォルダーを開く")
@@ -137,6 +173,9 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.open_pdf)
         actions.addWidget(self.open_folder)
         actions.addStretch()
+        self.save_as_button = QPushButton("名前を付けて保存…")
+        self.save_as_button.clicked.connect(lambda: self.start_generation(False, True))
+        actions.addWidget(self.save_as_button)
         self.preview_button = QPushButton("プレビューを更新")
         self.preview_button.clicked.connect(lambda: self.start_generation(True))
         actions.addWidget(self.preview_button)
@@ -161,6 +200,20 @@ class MainWindow(QMainWindow):
     def mark_stale(self, *_):
         self.preview_note.setText("現在の入力・設定を反映するには「プレビューを更新」を押してください。")
 
+    def refresh_output_directory(self):
+        self.output_path.setText(str(self.manager.output_directory()))
+        self.output_path.setToolTip(self.output_path.text())
+
+    def choose_output_directory(self):
+        path = QFileDialog.getExistingDirectory(self, "PDFの保存先フォルダーを選択", self.output_path.text())
+        if path:
+            self.manager.set_output_directory(path)
+            self.refresh_output_directory()
+
+    def reset_output_directory(self):
+        self.manager.set_output_directory()
+        self.refresh_output_directory()
+
     def update_count(self):
         self.count.setText(f"{len(parse_lines(self.editor.toPlainText())):,}件")
         self.mark_stale()
@@ -183,7 +236,7 @@ class MainWindow(QMainWindow):
             logger.warning("Text import failed", exc_info=True)
             QMessageBox.warning(self, "読み込みエラー", str(exc) if isinstance(exc, UserError) else "ファイルを読み込めません。アクセス権を確認してください。")
 
-    def start_generation(self, preview_only=False):
+    def start_generation(self, preview_only=False, save_as=False):
         if self.worker is not None:
             return
         texts = parse_lines(self.editor.toPlainText())
@@ -200,22 +253,28 @@ class MainWindow(QMainWindow):
             self.document.close()
             self.preview_buffer.close()
             path = str(Path(self.preview_directory.name) / "preview.pdf")
-        else:
-            path, _ = QFileDialog.getSaveFileName(self, "PDFを保存", f"QRSheet_{date.today().isoformat()}.pdf", "PDF (*.pdf)")
+        elif save_as:
+            proposed = self.manager.output_directory() / f"QRSheet_{date.today().isoformat()}.pdf"
+            path, _ = QFileDialog.getSaveFileName(self, "PDFを保存", str(proposed), "PDF (*.pdf)")
             if not path:
                 return
             if not path.lower().endswith(".pdf"):
                 path += ".pdf"
                 if Path(path).exists() and QMessageBox.question(self, "上書き確認", "同名のPDFがあります。上書きしますか？") != QMessageBox.StandardButton.Yes:
                     return
+        else:
+            path = self.manager.output_directory() / f"QRSheet_{date.today().isoformat()}.pdf"
         self.manager.save(settings)
         self.generate_button.setEnabled(False)
         self.preview_button.setEnabled(False)
+        self.save_as_button.setEnabled(False)
+        self.change_folder.setEnabled(False)
+        self.reset_folder.setEnabled(False)
         self.progress.setRange(0, len(texts))
         self.progress.setValue(0)
         self.progress.show()
         self.status.setText("PDFを生成しています…")
-        self.worker = PdfWorker(texts, path, settings, self)
+        self.worker = PdfWorker(texts, path, settings, self, automatic=not preview_only and not save_as)
         self.worker.progress.connect(lambda done, total: self.progress.setValue(done))
         self.worker.succeeded.connect(lambda saved, pages: self.generation_done(saved, pages, preview_only))
         self.worker.failed.connect(self.generation_failed)
@@ -244,6 +303,9 @@ class MainWindow(QMainWindow):
         worker.deleteLater()
         self.generate_button.setEnabled(True)
         self.preview_button.setEnabled(True)
+        self.save_as_button.setEnabled(True)
+        self.change_folder.setEnabled(True)
+        self.reset_folder.setEnabled(True)
         self.progress.hide()
 
     def open_path(self, path):

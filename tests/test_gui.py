@@ -3,6 +3,9 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 from qrsheet.settings.manager import SettingsManager, PdfSettings
 from qrsheet.ui.main_window import MainWindow
+from qrsheet.ui.main_window import PdfWorker
+from PySide6.QtWidgets import QFileDialog
+from pypdf import PdfReader
 
 
 def test_settings_roundtrip(tmp_path):
@@ -39,4 +42,61 @@ def test_gui_preview_worker(tmp_path):
         time.sleep(0.01)
     assert window.worker is None
     assert "更新された日本語" in window.document.getAllText(0).text()
+    window.close()
+
+
+def test_output_directory_default_change_and_reset(tmp_path, monkeypatch):
+    default = tmp_path / "Documents" / "QRSheet"
+    monkeypatch.setattr(SettingsManager, "default_output_directory", staticmethod(lambda: default))
+    store = QSettings(str(tmp_path / "output.ini"), QSettings.Format.IniFormat)
+    app = QApplication.instance() or QApplication([])
+    manager = SettingsManager(store)
+    window = MainWindow(manager)
+    assert window.output_path.text() == str(default)
+    custom = tmp_path / "日本語の保存先"
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(custom))
+    window.choose_output_directory()
+    assert SettingsManager(store).output_directory() == custom
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: "")
+    window.choose_output_directory()
+    assert manager.output_directory() == custom
+    window.reset_output_directory()
+    assert manager.output_directory() == default
+    assert not default.exists()
+    window.close()
+
+
+def test_automatic_save_preserves_existing_and_cleans_failed_output(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "new-folder" / "QRSheet.pdf"
+    first = PdfWorker(["最初のPDF"], path, PdfSettings(), automatic=True)
+    first.run()
+    original = path.read_bytes()
+    second = PdfWorker(["次のPDF"], path, PdfSettings(), automatic=True)
+    second.run()
+    assert path.read_bytes() == original
+    assert "次のPDF" in PdfReader(path.with_stem("QRSheet_001")).pages[0].extract_text()
+    failed = PdfWorker(["x" * 4000], path, PdfSettings(), automatic=True)
+    failed.run()
+    assert not path.with_stem("QRSheet_002").exists()
+
+
+def test_gui_saves_without_dialog(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    manager = SettingsManager(QSettings(str(tmp_path / "save.ini"), QSettings.Format.IniFormat))
+    manager.set_output_directory(tmp_path / "PDF")
+    window = MainWindow(manager)
+    window.editor.setPlainText("保存テスト")
+    def unexpected_dialog(*args):
+        raise AssertionError("Automatic generation must not ask for a filename")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", unexpected_dialog)
+    window.start_generation()
+    deadline = time.monotonic() + 30
+    while window.worker is not None and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert window.worker is None
+    assert window.last_pdf.parent == manager.output_directory()
+    assert "保存テスト" in PdfReader(window.last_pdf).pages[0].extract_text()
+    assert window.open_folder.isEnabled()
     window.close()
