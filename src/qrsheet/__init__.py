@@ -1,0 +1,1 @@
+"""QRSheet desktop application."""

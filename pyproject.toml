@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qrsheet"
+version = "1.0.0"
+description = "Japanese desktop QR code PDF generator"
+requires-python = ">=3.12"
+dependencies = ["PySide6>=6.8,<7", "qrcode>=8.2,<9", "reportlab>=4.4,<6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pypdf>=5,<7", "pyinstaller>=6,<7", "zxing-cpp>=2.3,<4", "pillow>=11,<13"]
+
+[project.gui-scripts]
+qrsheet = "qrsheet.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
