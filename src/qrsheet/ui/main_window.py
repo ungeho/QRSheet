@@ -10,7 +10,7 @@ from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget, QTabWidget, QScrollArea, QSizePolicy,
 )
 from qrsheet.pdf.generator import generate_pdf
 from qrsheet.qr.generator import parse_lines, UserError
@@ -94,6 +94,8 @@ class MainWindow(QMainWindow):
         input_header.addWidget(self.count)
         left.addLayout(input_header)
         self.editor = QPlainTextEdit()
+        self.editor.setMinimumHeight(72)
+        self.editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.editor.setPlaceholderText("https://example.com/\nABC-12345\nテスト用文字列")
         self.editor.textChanged.connect(self.update_count)
         left.addWidget(self.editor, 1)
@@ -104,7 +106,12 @@ class MainWindow(QMainWindow):
             helpers.addWidget(button)
         left.addLayout(helpers)
         group = QGroupBox("PDF設定")
-        form = QFormLayout(group)
+        group_layout = QVBoxLayout(group)
+        tabs = QTabWidget()
+        group_layout.addWidget(tabs)
+        basic = QWidget()
+        tabs.addTab(basic, "基本")
+        form = QFormLayout(basic)
         self.title = QLineEdit()
         self.title.setMaxLength(120)
         form.addRow("タイトル", self.title)
@@ -127,8 +134,47 @@ class MainWindow(QMainWindow):
         self.columns = QComboBox()
         self.columns.addItems(["自動", "1列", "2列", "3列", "4列"])
         form.addRow("カラム数", self.columns)
+        self.reset_pdf_settings_button = QPushButton("初期値に戻す")
+        self.reset_pdf_settings_button.clicked.connect(self.reset_pdf_settings)
+        layout_panel = QWidget()
+        tabs.addTab(layout_panel, "レイアウト")
+        placement = QFormLayout(layout_panel)
+        self.layout_controls = {}
+        for key, label, options in [
+            ("horizontal_align", "横方向の配置", [("左詰め", "left"), ("中央", "center"), ("右詰め", "right"), ("均等配置", "justify")]),
+            ("vertical_align", "縦方向の配置", [("上詰め", "top"), ("中央", "center"), ("下詰め", "bottom"), ("均等配置", "justify")]),
+        ]:
+            control = QComboBox()
+            for text, value in options:
+                control.addItem(text, value)
+            self.layout_controls[key] = control
+            placement.addRow(label, control)
+        for label, fields in [
+            ("カード間隔", [("horizontal_gap_mm", "横"), ("vertical_gap_mm", "縦")]),
+            ("上下余白", [("margin_top_mm", "上"), ("margin_bottom_mm", "下")]),
+            ("左右余白", [("margin_left_mm", "左"), ("margin_right_mm", "右")]),
+        ]:
+            row = QHBoxLayout()
+            for key, caption in fields:
+                control = QSpinBox()
+                control.setRange(0, 100)
+                control.setSuffix(" mm")
+                control.setAccessibleName(label + caption)
+                self.layout_controls[key] = control
+                row.addWidget(QLabel(caption))
+                row.addWidget(control)
+            placement.addRow(label, row)
+        note = QLabel("均等配置は指定間隔を最小にして余りを分配します。\nカード幅はQRサイズ＋4mm。入りきらない列数はエラーになります。")
+        note.setWordWrap(True)
+        note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        placement.addRow(note)
+        group_layout.addWidget(self.reset_pdf_settings_button)
         left.addWidget(group)
-        split.addWidget(editor_panel)
+        editor_scroll = QScrollArea()
+        editor_scroll.setWidgetResizable(True)
+        editor_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        editor_scroll.setWidget(editor_panel)
+        split.addWidget(editor_scroll)
         preview_panel = QWidget()
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.addWidget(QLabel("PDFプレビュー"))
@@ -186,7 +232,16 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
         self.setCentralWidget(root)
         self.setStyleSheet("QPushButton { min-height: 26px; padding: 4px 10px; } QGroupBox { margin-top: 10px; padding-top: 16px; } QPlainTextEdit { padding: 8px; }")
-        settings = self.manager.load()
+        tabs.setMinimumHeight(tabs.sizeHint().height())
+        group.setMinimumHeight(group.sizeHint().height())
+        self.apply_pdf_settings(self.manager.load())
+        for signal in [self.title.textChanged, self.show_title.toggled, self.show_date.toggled, self.paper.currentIndexChanged, self.orientation.currentIndexChanged, self.qr_size.valueChanged, self.columns.currentIndexChanged]:
+            signal.connect(self.mark_stale)
+        for control in self.layout_controls.values():
+            signal = control.currentIndexChanged if isinstance(control, QComboBox) else control.valueChanged
+            signal.connect(self.mark_stale)
+
+    def apply_pdf_settings(self, settings):
         self.title.setText(settings.title)
         self.show_title.setChecked(settings.show_title)
         self.show_date.setChecked(settings.show_date)
@@ -194,8 +249,18 @@ class MainWindow(QMainWindow):
         self.orientation.setCurrentIndex(int(settings.landscape))
         self.qr_size.setValue(settings.qr_mm)
         self.columns.setCurrentIndex(settings.columns)
-        for signal in [self.title.textChanged, self.show_title.toggled, self.show_date.toggled, self.paper.currentIndexChanged, self.orientation.currentIndexChanged, self.qr_size.valueChanged, self.columns.currentIndexChanged]:
-            signal.connect(self.mark_stale)
+        for key, control in self.layout_controls.items():
+            value = getattr(settings, key)
+            if isinstance(control, QComboBox):
+                control.setCurrentIndex(control.findData(value))
+            else:
+                control.setValue(value)
+
+    def reset_pdf_settings(self):
+        settings = PdfSettings()
+        self.apply_pdf_settings(settings)
+        self.manager.save(settings)
+        self.mark_stale()
 
     def mark_stale(self, *_):
         self.preview_note.setText("現在の入力・設定を反映するには「プレビューを更新」を押してください。")
@@ -219,7 +284,7 @@ class MainWindow(QMainWindow):
         self.mark_stale()
 
     def current_settings(self):
-        return PdfSettings(self.title.text(), self.show_title.isChecked(), self.show_date.isChecked(), self.paper.currentText(), bool(self.orientation.currentIndex()), self.qr_size.value(), self.columns.currentIndex())
+        return PdfSettings(self.title.text(), self.show_title.isChecked(), self.show_date.isChecked(), self.paper.currentText(), bool(self.orientation.currentIndex()), self.qr_size.value(), self.columns.currentIndex(), **{key: control.currentData() if isinstance(control, QComboBox) else control.value() for key, control in self.layout_controls.items()})
 
     def import_text(self):
         path, _ = QFileDialog.getOpenFileName(self, "テキストファイルを読み込む", "", "テキストファイル (*.txt)")
@@ -270,6 +335,7 @@ class MainWindow(QMainWindow):
         self.save_as_button.setEnabled(False)
         self.change_folder.setEnabled(False)
         self.reset_folder.setEnabled(False)
+        self.reset_pdf_settings_button.setEnabled(False)
         self.progress.setRange(0, len(texts))
         self.progress.setValue(0)
         self.progress.show()
@@ -306,6 +372,7 @@ class MainWindow(QMainWindow):
         self.save_as_button.setEnabled(True)
         self.change_folder.setEnabled(True)
         self.reset_folder.setEnabled(True)
+        self.reset_pdf_settings_button.setEnabled(True)
         self.progress.hide()
 
     def open_path(self, path):

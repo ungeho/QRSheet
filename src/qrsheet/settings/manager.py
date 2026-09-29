@@ -13,7 +13,21 @@ class PdfSettings:
     qr_mm: int = 35
     columns: int = 0
 
+    horizontal_align: str = "left"
+    vertical_align: str = "top"
+    horizontal_gap_mm: int = 5
+    vertical_gap_mm: int = 5
+    margin_top_mm: int = 15
+    margin_bottom_mm: int = 15
+    margin_left_mm: int = 15
+    margin_right_mm: int = 15
+
     def validate(self):
+        if self.horizontal_align not in ("left", "center", "right", "justify") or self.vertical_align not in ("top", "center", "bottom", "justify"):
+            raise UserError("配置設定が無効です。")
+        for value in (self.horizontal_gap_mm, self.vertical_gap_mm, self.margin_top_mm, self.margin_bottom_mm, self.margin_left_mm, self.margin_right_mm):
+            if type(value) is not int or not 0 <= value <= 100:
+                raise UserError("カード間隔・ページ余白は0〜100mmで指定してください。")
         if not isinstance(self.title, str) or any(type(value) is not bool for value in (self.show_title, self.show_date, self.landscape)):
             raise UserError("タイトルまたは表示設定が無効です。設定を確認してください。")
         if self.paper not in ("A4", "Letter") or type(self.qr_mm) is not int or not 20 <= self.qr_mm <= 60 or type(self.columns) is not int or self.columns not in range(5):

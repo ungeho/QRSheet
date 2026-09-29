@@ -1,4 +1,5 @@
 import time
+from dataclasses import asdict
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 from qrsheet.settings.manager import SettingsManager, PdfSettings
@@ -14,7 +15,7 @@ def test_settings_roundtrip(tmp_path):
     value = PdfSettings(paper="Letter", columns=2, landscape=True, show_date=False)
     manager.save(value)
     assert SettingsManager(store).load() == value
-    assert set(store.allKeys()) == {"title", "show_title", "show_date", "paper", "landscape", "qr_mm", "columns"}
+    assert set(store.allKeys()) == set(asdict(PdfSettings()))
     store.setValue("columns", 99)
     assert manager.load() == PdfSettings()
 
@@ -100,3 +101,27 @@ def test_gui_saves_without_dialog(tmp_path, monkeypatch):
     assert "保存テスト" in PdfReader(window.last_pdf).pages[0].extract_text()
     assert window.open_folder.isEnabled()
     window.close()
+
+
+def test_layout_settings_restore_and_reset(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    manager = SettingsManager(QSettings(str(tmp_path / "layout.ini"), QSettings.Format.IniFormat))
+    custom = PdfSettings(horizontal_align="right", vertical_align="bottom", horizontal_gap_mm=0,
+                         vertical_gap_mm=12, margin_top_mm=20, margin_bottom_mm=7,
+                         margin_left_mm=8, margin_right_mm=9)
+    manager.save(custom)
+    window = MainWindow(manager)
+    assert window.current_settings() == custom
+    window.layout_controls["horizontal_align"].setCurrentIndex(1)
+    window.layout_controls["vertical_gap_mm"].setValue(0)
+    changed = window.current_settings()
+    window.close()
+    restored = MainWindow(manager)
+    assert restored.current_settings() == changed
+    restored.editor.setPlainText("入力を保持")
+    restored.reset_pdf_settings_button.click()
+    assert restored.current_settings() == PdfSettings()
+    assert manager.load() == PdfSettings()
+    assert restored.editor.toPlainText() == "入力を保持"
+    assert "プレビューを更新" in restored.preview_note.text()
+    restored.close()
